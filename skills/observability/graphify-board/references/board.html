@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Graphify Board — dataflow playback</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; display: flex; height: 100vh; }
+  #left { flex: 1; display: flex; flex-direction: column; }
+  #toolbar { padding: 8px 12px; border-bottom: 1px solid #ddd; display: flex; gap: 12px; align-items: center; }
+  #timeline { flex: 1; }
+  #stage { flex: 1; overflow: auto; background: #fafafa; }
+  #panel { width: 340px; border-left: 1px solid #ddd; padding: 12px; overflow: auto; }
+  .node { cursor: pointer; }
+  .node rect { stroke-width: 2; }
+  .st-pending rect { fill: #f5f5f5; stroke: #bbb; }
+  .st-running rect { fill: #fff8e1; stroke: #f9a825; }
+  .st-ok rect { fill: #e8f5e9; stroke: #2e7d32; }
+  .st-error rect { fill: #ffebee; stroke: #c62828; }
+  .st-skipped rect { fill: #eeeeee; stroke: #9e9e9e; stroke-dasharray: 4 3; }
+  .node text { font-size: 12px; }
+  .err h3 { color: #c62828; }
+  dl { font-size: 13px; } dt { font-weight: bold; margin-top: 8px; } dd { margin: 2px 0 0 0; }
+  code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="left">
+  <div id="toolbar">
+    <button id="sample">Load sample capture</button>
+    <input type="file" id="file" accept=".jsonl">
+    <label>t=<span id="tval">0.00</span>s</label>
+    <input type="range" id="timeline" min="0" max="1" step="0.01" value="0">
+    <span id="runid"></span>
+  </div>
+  <div id="stage"><svg id="svg" width="900" height="500"></svg></div>
+</div>
+<div id="panel"><h2>Graphify Board</h2><p>Load a capture, scrub the timeline, click a node.</p></div>
+
+<script>
+let def = null, events = [], maxT = 1;
+
+document.getElementById('sample').onclick = async () => {
+  const r = await fetch('sample-capture.jsonl');
+  load(await r.text());
+};
+document.getElementById('file').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  const rd = new FileReader(); rd.onload = () => load(rd.result); rd.readAsText(f);
+};
+document.getElementById('timeline').oninput = e => {
+  document.getElementById('tval').textContent = (+e.target.value).toFixed(2);
+  replay(+e.target.value);
+};
+
+function load(text) {
+  const lines = text.trim().split('\n').map(l => JSON.parse(l));
+  def = lines.find(l => l.event === 'graph_def');
+  events = lines.filter(l => l.event !== 'graph_def').sort((a, b) => a.t - b.t);
+  maxT = Math.max(...events.map(e => e.t), 1);
+  const tl = document.getElementById('timeline');
+  tl.max = maxT; tl.value = maxT;
+  document.getElementById('tval').textContent = maxT.toFixed(2);
+  document.getElementById('runid').textContent = def ? def.run_id : '';
+  layout(); replay(maxT);
+}
+
+function depthOf(id, memo = {}) {
+  if (memo[id] !== undefined) return memo[id];
+  const n = def.nodes.find(n => n.id === id);
+  const d = n.dependencies.length ? 1 + Math.max(...n.dependencies.map(p => depthOf(p, memo))) : 0;
+  return memo[id] = d;
+}
+
+let pos = {};
+function layout() {
+  const svg = document.getElementById('svg');
+  svg.innerHTML = '';
+  const depths = {};
+  def.nodes.forEach(n => {
+    const d = depthOf(n.id);
+    (depths[d] = depths[d] || []).push(n);
+  });
+  const W = 200, H = 110;
+  Object.entries(depths).forEach(([d, ns]) => {
+    ns.forEach((n, i) => { pos[n.id] = { x: 30 + d * (W + 60), y: 30 + i * H }; });
+  });
+  // edges
+  def.nodes.forEach(n => n.dependencies.forEach(dep => {
+    const a = pos[dep], b = pos[n.id];
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('x1', a.x + W); line.setAttribute('y1', a.y + 30);
+    line.setAttribute('x2', b.x); line.setAttribute('y2', b.y + 30);
+    line.setAttribute('stroke', '#999'); line.setAttribute('marker-end', 'url(#arr)');
+    line.dataset.edge = dep + '->' + n.id;
+    svg.appendChild(line);
+    const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    lab.setAttribute('x', (a.x + W + b.x) / 2); lab.setAttribute('y', (a.y + b.y) / 2 + 24);
+    lab.setAttribute('font-size', '11'); lab.setAttribute('fill', '#666');
+    lab.dataset.edgelabel = dep + '->' + n.id;
+    svg.appendChild(lab);
+  }));
+  const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+  defs.innerHTML = '<marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="none" stroke="#999"/></marker>';
+  svg.appendChild(defs);
+  // nodes
+  def.nodes.forEach(n => {
+    const p = pos[n.id];
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('class', 'node st-pending'); g.dataset.node = n.id;
+    g.innerHTML = `<rect x="${p.x}" y="${p.y}" width="${W}" height="60" rx="8"></rect>
+      <text x="${p.x + 10}" y="${p.y + 22}">${n.label}</text>
+      <text x="${p.x + 10}" y="${p.y + 40}" font-size="10" fill="#666">${n.kind} · ${n.id}</text>`;
+    g.onclick = () => showDetail(n.id);
+    svg.appendChild(g);
+  });
+  const maxDepth = Math.max(...Object.keys(depths).map(Number));
+  svg.setAttribute('width', 60 + (maxDepth + 1) * (W + 60));
+  svg.setAttribute('height', 60 + Math.max(...Object.values(depths).map(a => a.length)) * H);
+}
+
+let state = {};
+function replay(t) {
+  state = {};
+  def.nodes.forEach(n => state[n.id] = { status: 'pending' });
+  const edgeLabels = {};
+  events.filter(e => e.t <= t).forEach(e => {
+    const s = state[e.node];
+    if (e.event === 'node_start') s.status = 'running';
+    if (e.event === 'node_end') { s.status = 'ok'; s.duration_ms = e.duration_ms; s.outputs = e.outputs; }
+    if (e.event === 'node_error') { s.status = 'error'; s.duration_ms = e.duration_ms; s.error = e.error; }
+    if (e.event === 'edge_data') edgeLabels[e.from + '->' + e.to] = e.summary;
+  });
+  document.querySelectorAll('.node').forEach(g => {
+    g.setAttribute('class', 'node st-' + state[g.dataset.node].status);
+  });
+  document.querySelectorAll('[data-edgelabel]').forEach(t2 => {
+    t2.textContent = edgeLabels[t2.dataset.edgelabel] || '';
+  });
+}
+
+function showDetail(id) {
+  const n = def.nodes.find(n => n.id === id);
+  const s = state[id] || {};
+  const p = document.getElementById('panel');
+  let html = `<h2>${n.label}</h2>
+    <dl>
+    <dt>Status</dt><dd><code>${s.status || 'pending'}</code></dd>
+    <dt>Function</dt><dd><code>${n.function}</code></dd>
+    <dt>Kind</dt><dd>${n.kind}</dd>
+    <dt>Dependencies</dt><dd>${n.dependencies.length ? n.dependencies.map(d => `<code>${d}</code>`).join(', ') : '—'}</dd>
+    <dt>Inputs</dt><dd>${Object.entries(n.inputs || {}).map(([k, v]) => `<code>${k}: ${v}</code>`).join('<br>')}</dd>
+    <dt>Outputs</dt><dd>${s.outputs ? Object.entries(s.outputs).map(([k, v]) => `<code>${k}: ${v}</code>`).join('<br>') : '—'}</dd>
+    ${s.duration_ms !== undefined ? `<dt>Duration</dt><dd>${s.duration_ms} ms</dd>` : ''}
+    </dl>`;
+  if (s.status === 'error' && s.error) {
+    const e = s.error;
+    html += `<div class="err"><h3>Error — five Ws</h3><dl>
+      <dt>What</dt><dd>${e.what}</dd>
+      <dt>When</dt><dd>${e.when}</dd>
+      <dt>Where</dt><dd><code>${e.where}</code></dd>
+      <dt>Why</dt><dd>${e.why}</dd>
+      <dt>How</dt><dd>${e.how}</dd>
+      </dl></div>`;
+  }
+  p.innerHTML = html;
+}
+</script>
+</body>
+</html>
